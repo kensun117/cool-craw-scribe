@@ -18,6 +18,7 @@ def build_bot() -> commands.Bot:
         logging.getLogger(__name__).info("Bot online: %s (%s)", bot.user, bot.user.id if bot.user else "n/a")
 
     bot.load_extension("cogs.meeting_recorder")
+    bot.load_extension("cogs.realtime_voice")
     return bot
 
 
