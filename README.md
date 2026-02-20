@@ -80,6 +80,109 @@ python bot.py
 └── .env.example
 ```
 
+## voice_bot.py 快速启动
+
+`voice_bot.py` 是当前的实时语音转录 bot（区别于 `bot.py` 的 cog 架构版本）。
+
+### 手动启动
+
+```bash
+source .venv/bin/activate
+export $(grep -v '^#' .env.voice | xargs)
+python voice_bot.py
+```
+
+### 以 macOS 系统服务运行（推荐）
+
+用 `launchd` 实现开机自启、崩溃自动重启：
+
+**1. 创建 plist 文件**
+
+```bash
+cat > ~/Library/LaunchAgents/com.cooltools.voicebot.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cooltools.voicebot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/project/.venv/bin/python</string>
+        <string>/path/to/project/voice_bot.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/project</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>VOICE_DISCORD_TOKEN</key>
+        <string>YOUR_TOKEN_HERE</string>
+        <key>HF_TOKEN</key>
+        <string>YOUR_HF_TOKEN_HERE</string>
+        <key>OPENCLAW_GATEWAY_URL</key>
+        <string>http://localhost:18789</string>
+        <key>OPENCLAW_GATEWAY_TOKEN</key>
+        <string>YOUR_OPENCLAW_TOKEN_HERE</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/voicebot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/voicebot.log</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+EOF
+```
+
+**2. 加载服务**
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.cooltools.voicebot.plist
+```
+
+**常用管理命令**
+
+```bash
+# 查看运行状态（第一列是 PID，非 - 表示运行中）
+launchctl list | grep voicebot
+
+# 实时查看日志
+tail -f ~/Library/Logs/voicebot.log
+
+# 手动停止 / 启动
+launchctl stop com.cooltools.voicebot
+launchctl start com.cooltools.voicebot
+
+# 彻底卸载服务
+launchctl unload ~/Library/LaunchAgents/com.cooltools.voicebot.plist
+```
+
+### Discord 使用方式
+
+1. 进入语音频道
+2. 在文字频道执行 `/voice_on`（可选参数 `language`，默认 `zh`）
+3. Bot 加入语音频道后开始录音，每 ~3 秒输出一次转录
+4. 执行 `/voice_off` 停止并退出
+
+### 前置依赖
+
+```bash
+# libopus（音频解码）
+brew install opus
+
+# ffmpeg（mlx-whisper 音频处理）
+brew install ffmpeg
+```
+
+---
+
 ## 本地测试（不连 Discord）
 
 `local_mic_test.py` 用于在不连接 Discord 的情况下测试麦克风采集和 mlx-whisper 转录效果。排查问题时优先用此工具验证本地环境是否正常。
