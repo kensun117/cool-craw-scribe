@@ -46,6 +46,24 @@ WHISPER_INITIAL_PROMPT = {
     "en": "",
 }
 
+MIN_SPEECH_DURATION = 1.0  # 低于此秒数的片段不送 Whisper
+
+
+def _is_hallucination(text: str) -> bool:
+    """检测 Whisper 幻觉：单个字符重复超过 10 次，或最长重复子串占比超过 50%。"""
+    if not text:
+        return False
+    # 单字符重复检测
+    for ch in set(text):
+        if text.count(ch) > max(10, len(text) * 0.5):
+            return True
+    # 短语重复检测：取前 10 个字符作为模式，看重复次数
+    if len(text) >= 20:
+        pattern = text[:5]
+        if text.count(pattern) > len(text) / (len(pattern) * 2):
+            return True
+    return False
+
 
 @dataclass
 class SpeakerProfile:
@@ -309,6 +327,12 @@ class VoiceBot(commands.Bot):
             arr = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
         audio_float = self._resample_tensor(arr, SAMPLE_RATE, TARGET_RATE)
 
+        # 音频太短不送 Whisper，避免幻觉
+        duration = len(audio_float) / TARGET_RATE
+        if duration < MIN_SPEECH_DURATION:
+            LOGGER.debug("Skipping short segment %.2fs for user %d", duration, user_id)
+            return
+
         language = "zh"
         for session in self.active_sessions.values():
             language = session.get("language", "zh")
@@ -333,7 +357,7 @@ class VoiceBot(commands.Bot):
             )
 
             text = result.get("text", "").strip()
-            if text and len(text) > 2:
+            if text and len(text) > 2 and not _is_hallucination(text):
                 LOGGER.info("[%s] %s", speaker_name, text)
                 for session in self.active_sessions.values():
                     ch = session.get("text_channel")
@@ -539,7 +563,7 @@ class VoiceBot(commands.Bot):
                             initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
                         )
                         text = result.get("text", "").strip()
-                        if text and len(text) > 1:
+                        if text and len(text) > 1 and not _is_hallucination(text):
                             speaker_name = label_to_name.get(label, label)
                             entries.append({"speaker": speaker_name, "start": start, "text": text})
                     except Exception:
