@@ -227,6 +227,7 @@ class VoiceBot(commands.Bot):
         self.vad = SileroVAD()
         self.speaker_recognizer = SpeakerRecognizer()
         self.processing_task = None
+        self._diarization_pipeline = None  # 懒加载，避免每次重新下载
         # Per-user speech state: {user_id: {"buffer": bytes, "last_speech": float, "speech_start": float}}
         self.speech_state: dict[int, dict] = {}
         # Per-user read position into sink BytesIO (avoids seek/truncate race with sink writer)
@@ -384,13 +385,16 @@ class VoiceBot(commands.Bot):
         返回 [(start_sec, end_sec, speaker_label), ...]，按时间排序。
         需要 HF_TOKEN 且已在 HuggingFace 接受 pyannote 模型使用条款。
         """
-        from pyannote.audio import Pipeline
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=HF_TOKEN,
-        )
-        pipeline.to(torch.device("cpu"))
-        diarization = pipeline(str(wav_path))
+        if self._diarization_pipeline is None:
+            from pyannote.audio import Pipeline
+            self._diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=HF_TOKEN,
+            )
+            device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+            LOGGER.info("Diarization pipeline loaded, using device: %s", device)
+            self._diarization_pipeline.to(device)
+        diarization = self._diarization_pipeline(str(wav_path))
         segments = []
         for turn, _, speaker in diarization.itertracks(yield_label=True):
             segments.append((turn.start, turn.end, speaker))
