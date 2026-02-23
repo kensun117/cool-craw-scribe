@@ -40,6 +40,12 @@ PROFILES_DIR = Path("data/speaker_profiles")
 PROFILES_JSON = PROFILES_DIR / "profiles.json"
 EMBEDDINGS_DIR = PROFILES_DIR / "embeddings"
 
+# Whisper initial_prompt：引导输出简体中文，避免输出繁体
+WHISPER_INITIAL_PROMPT = {
+    "zh": "以下是普通话的转录，使用简体中文。",
+    "en": "",
+}
+
 
 @dataclass
 class SpeakerProfile:
@@ -323,6 +329,7 @@ class VoiceBot(commands.Bot):
                 path_or_hf_repo="mlx-community/whisper-small-mlx",
                 language=language,
                 word_timestamps=False,
+                initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
             )
 
             text = result.get("text", "").strip()
@@ -386,29 +393,63 @@ class VoiceBot(commands.Bot):
                 label_audio.setdefault(label, []).append(chunk)
 
         self.speaker_recognizer.load_model()
-        label_to_name: dict[str, str] = {}
 
+        # 第一步：提取每个 label 的 embedding
+        label_embedding: dict[str, Optional[np.ndarray]] = {}
         for label, chunks in label_audio.items():
             combined = np.concatenate(chunks)
-            # 需要至少 0.5 秒才有意义
             if len(combined) < TARGET_RATE * 0.5:
-                label_to_name[label] = f"{label}(匿名)"
+                label_embedding[label] = None
                 continue
-
             temp_dir = Path(tempfile.mkdtemp())
             try:
                 temp_wav = temp_dir / f"spk_{label}.wav"
                 sf.write(str(temp_wav), combined, TARGET_RATE)
-                speaker_id, score = self.speaker_recognizer.identify_speaker(temp_wav)
-                if speaker_id and speaker_id in self.speaker_recognizer.speaker_profiles:
-                    name = self.speaker_recognizer.speaker_profiles[speaker_id].username
-                    LOGGER.info("Diarization %s → %s (score=%.3f)", label, name, score)
-                    label_to_name[label] = name
-                else:
-                    LOGGER.info("Diarization %s → 未匹配 (score=%.3f)", label, score)
-                    label_to_name[label] = f"{label}(匿名)"
+                self.speaker_recognizer.load_model()
+                emb = self.speaker_recognizer.extract_embedding(temp_wav)
+                label_embedding[label] = emb
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # 第二步：构建 label × profile 相似度矩阵，做最优一对一分配
+        # 每个注册人只能匹配给相似度最高的那个 label，避免所有 label 都匹配到同一人
+        profiles = {
+            uid: p for uid, p in self.speaker_recognizer.speaker_profiles.items()
+            if p.embedding is not None
+        }
+        label_to_name: dict[str, str] = {}
+
+        if profiles:
+            # 计算所有 (label, profile) 对的相似度
+            scores: list[tuple[float, str, int]] = []  # (score, label, user_id)
+            for label, emb in label_embedding.items():
+                if emb is None:
+                    continue
+                for uid, profile in profiles.items():
+                    sim = float(np.dot(emb.flatten(), profile.embedding.flatten()) / (
+                        np.linalg.norm(emb) * np.linalg.norm(profile.embedding) + 1e-9
+                    ))
+                    scores.append((sim, label, uid))
+
+            # 贪心最优分配：按相似度从高到低，每个 label 和每个 profile 只用一次
+            scores.sort(reverse=True)
+            used_labels: set[str] = set()
+            used_profiles: set[int] = set()
+            for sim, label, uid in scores:
+                if label in used_labels or uid in used_profiles:
+                    continue
+                if sim >= self.speaker_recognizer.similarity_threshold:
+                    name = profiles[uid].username
+                    LOGGER.info("Diarization %s → %s (score=%.3f)", label, name, sim)
+                    label_to_name[label] = name
+                    used_labels.add(label)
+                    used_profiles.add(uid)
+
+        # 未匹配到的 label 标记为匿名
+        for label in label_embedding:
+            if label not in label_to_name:
+                LOGGER.info("Diarization %s → 未匹配，标记匿名", label)
+                label_to_name[label] = f"{label}(匿名)"
 
         return label_to_name
 
@@ -495,6 +536,7 @@ class VoiceBot(commands.Bot):
                             path_or_hf_repo="mlx-community/whisper-small-mlx",
                             language=language,
                             word_timestamps=False,
+                            initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
                         )
                         text = result.get("text", "").strip()
                         if text and len(text) > 1:
