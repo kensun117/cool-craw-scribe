@@ -651,17 +651,18 @@ def main():
 
     @bot.slash_command(name="voice_on", description="开启实时语音转文字")
     async def voice_on(ctx: discord.ApplicationContext, language: str = "zh"):
+        # defer 必须在 3 秒内调用，放在最前面避免后续操作超时
+        await ctx.defer()
+
         member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
         if not member or not member.voice or not member.voice.channel:
-            await ctx.respond("❌ 你需要先进入语音频道！", ephemeral=True)
+            await ctx.followup.send("❌ 你需要先进入语音频道！")
             return
 
         guild_id = ctx.guild_id
         if guild_id in bot.active_sessions:
-            await ctx.respond("⚠️ 已经在转录中了！", ephemeral=True)
+            await ctx.followup.send("⚠️ 已经在转录中了！")
             return
-
-        await ctx.defer()
 
         voice_channel = member.voice.channel
         voice_client = await voice_channel.connect()
