@@ -41,6 +41,8 @@ PROFILES_JSON = PROFILES_DIR / "profiles.json"
 EMBEDDINGS_DIR = PROFILES_DIR / "embeddings"
 
 # Whisper initial_prompt：引导输出简体中文，避免输出繁体
+WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
+
 WHISPER_INITIAL_PROMPT = {
     "zh": "以下是普通话的转录，使用简体中文。",
     "en": "",
@@ -354,7 +356,7 @@ class VoiceBot(commands.Bot):
             result = await asyncio.to_thread(
                 mlx_whisper.transcribe,
                 str(temp_wav),
-                path_or_hf_repo="mlx-community/whisper-small-mlx",
+                path_or_hf_repo=WHISPER_MODEL,
                 language=language,
                 word_timestamps=False,
                 initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
@@ -567,7 +569,7 @@ class VoiceBot(commands.Bot):
                         result = await asyncio.to_thread(
                             mlx_whisper.transcribe,
                             str(seg_wav),
-                            path_or_hf_repo="mlx-community/whisper-small-mlx",
+                            path_or_hf_repo=WHISPER_MODEL,
                             language=language,
                             word_timestamps=False,
                             initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
