@@ -8,3 +8,4 @@ numpy>=1.26.0
 soundfile>=0.12.1
 silero-vad>=4.0.0
 aiohttp>=3.9.0
+matplotlib
