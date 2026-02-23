@@ -123,6 +123,9 @@ class SpeakerRecognizer:
                     embedding=embedding,
                     registered_at=meta.get("registered_at", time.time()),
                 )
+            for uid, p in self.speaker_profiles.items():
+                emb_shape = p.embedding.shape if p.embedding is not None else None
+                LOGGER.info("  Profile: uid=%s name=%s embedding=%s", uid, p.username, emb_shape)
             LOGGER.info("Loaded %d speaker profile(s) from disk", len(self.speaker_profiles))
         except Exception:
             LOGGER.exception("Failed to load speaker profiles")
@@ -453,6 +456,9 @@ class VoiceBot(commands.Bot):
                     sim = float(np.dot(emb.flatten(), profile.embedding.flatten()) / (
                         np.linalg.norm(emb) * np.linalg.norm(profile.embedding) + 1e-9
                     ))
+                    LOGGER.info("Similarity %s vs %s: %.4f (threshold=%.2f)",
+                                label, profile.username, sim,
+                                self.speaker_recognizer.similarity_threshold)
                     scores.append((sim, label, uid))
 
             # 贪心最优分配：按相似度从高到低，每个 label 和每个 profile 只用一次
@@ -676,7 +682,8 @@ def main():
     @bot.slash_command(name="voice_on", description="开启实时语音转文字")
     async def voice_on(ctx: discord.ApplicationContext, language: str = "zh"):
         # defer 必须在 3 秒内调用，放在最前面避免后续操作超时
-        await ctx.defer()
+        if not ctx.response.is_done():
+            await ctx.defer()
 
         member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
         if not member or not member.voice or not member.voice.channel:
@@ -830,7 +837,8 @@ def main():
             await ctx.respond("⚠️ 没有在运行的转录。", ephemeral=True)
             return
 
-        await ctx.defer()
+        if not ctx.response.is_done():
+            await ctx.defer()
 
         session = bot.active_sessions.pop(guild_id)
         voice_client = session["voice_client"]
