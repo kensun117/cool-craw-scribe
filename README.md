@@ -10,7 +10,7 @@ CoolScribe 是 CoolTools 生态中的会议效率工具。它加入 Discord 语�
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | 实时语音转录 + 声纹识别 + 持久化 | 开发中 |
+| Phase 1 | 实时语音转录 + 声纹识别 + 持久化 | 已完成 |
 | Phase 2 | OpenClaw 会议交互（语音触发、确认执行） | 待实现 |
 
 详细规格文档：
@@ -45,38 +45,41 @@ pip install -r requirements.txt
 
 # 配置环境变量
 cp .env.example .env
-# 编辑 .env 填写 DISCORD_BOT_TOKEN 和 HF_TOKEN
+# 编辑 .env 填写 VOICE_DISCORD_TOKEN 和 HF_TOKEN
 
-# 启动
-export $(grep -v '^#' .env | xargs)
-python bot.py
+# 启动（自动加载 .env）
+python voice_bot.py
 ```
 
 ## 环境变量
 
 | 变量 | 必需 | 说明 |
 |------|------|------|
-| `DISCORD_BOT_TOKEN` | 是 | Discord Bot Token |
-| `HF_TOKEN` | 是 | HuggingFace Token（需有 pyannote/speaker-diarization-3.1 访问权限） |
+| `VOICE_DISCORD_TOKEN` | 是 | Discord Bot Token |
+| `HF_TOKEN` | 是 | HuggingFace Token（声纹模型下载） |
 | `LOG_LEVEL` | 否 | 日志级别，默认 INFO |
-| `OPENCLAW_GATEWAY_URL` | 否 | OpenClaw Gateway WebSocket 地址（Phase 2） |
-| `OPENCLAW_GATEWAY_TOKEN` | 否 | OpenClaw Gateway Token（Phase 2） |
+| `OPENCLAW_GATEWAY_URL` | 否 | OpenClaw Gateway 地址，默认 http://localhost:18789 |
+| `OPENCLAW_GATEWAY_TOKEN` | 否 | OpenClaw Gateway Token |
 
 ## 项目结构
 
 ```
 .
-├── bot.py                  # 入口，加载 cogs
+├── voice_bot.py            # 主入口（实时转录 bot）
+├── bot.py                  # 旧架构入口（cog 版，暂不使用）
 ├── cogs/
-│   ├── meeting_recorder.py # 会后批量转录（声纹分离 + 转录 + 合并）
-│   └── realtime_voice.py   # 实时语音转录（Phase 1 重构目标）
+│   ├── meeting_recorder.py # 会后批量转录 cog
+│   └── realtime_voice.py   # 实时转录 cog（旧版）
 ├── data/
-│   └── speaker_profiles/   # 声纹持久化存储（Phase 1 新增）
+│   └── speaker_profiles/   # 声纹持久化存储
+│       ├── profiles.json
+│       └── embeddings/
 ├── doc/
 │   ├── phase1-realtime-transcription.md
 │   └── phase2-openclaw-interaction.md
-├── local_mic_test.py       # 本地麦克风测试工具
+├── local_mic_test.py       # 本地麦克风测试工具（不连 Discord）
 ├── requirements.txt
+├── .env                    # 环境变量（gitignore）
 └── .env.example
 ```
 
@@ -88,8 +91,7 @@ python bot.py
 
 ```bash
 source .venv/bin/activate
-export $(grep -v '^#' .env.voice | xargs)
-python voice_bot.py
+python voice_bot.py   # 自动加载 .env
 ```
 
 ### 以 macOS 系统服务运行（推荐）
@@ -168,7 +170,7 @@ launchctl unload ~/Library/LaunchAgents/com.cooltools.voicebot.plist
 
 1. 进入语音频道
 2. 在文字频道执行 `/voice_on`（可选参数 `language`，默认 `zh`）
-3. Bot 加入语音频道后开始录音，每 ~3 秒输出一次转录
+3. Bot 加入语音频道后开始录音，检测到停顿后自动输出当前句子
 4. 执行 `/voice_off` 停止并退出
 
 ### 前置依赖

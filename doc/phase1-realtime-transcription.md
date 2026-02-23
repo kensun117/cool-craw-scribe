@@ -1,66 +1,94 @@
 # Phase 1: 实时语音转录 + 声纹识别
 
-> 状态：开发中
+> 状态：已完成（voice_bot.py）
 
 ## 目标
 
 用户在 Discord 语音频道开会时，机器人实时将语音转为文字，通过声纹识别标注说话人，转录结果显示在语音频道的文字聊天中。会议结束时生成完整的会议原始纪要。
 
-## 功能清单
+---
 
-### 1. 实时语音转录
+## 当前实现：voice_bot.py
 
-**用户操作：**
-- `/start_voice_chat [language]` — 机器人加入语音频道，开始实时转录
-- `/stop_voice_chat` — 停止转录，机器人离开频道，输出完整纪要
+### 入口文件
 
-**行为：**
-- 机器人加入用户所在的语音频道
-- 持续接收音频，每 2 秒处理一个片段
-- 通过 Silero VAD 检测语音活动，跳过静音
-- 使用 mlx-whisper 转录语音为文字
-- 转录结果实时发送到**语音频道的文字聊天**中
-- 支持中文 (`zh`) 和英文 (`en`)
-
-**输出格式：**
 ```
-[张三]: 我觉得部署方案可以用 Vercel
-[李四]: 那数据库怎么处理？
-[张三]: 用 Supabase 就行
+voice_bot.py       # 独立运行，不依赖 bot.py / cogs 架构
 ```
 
-**不带时间戳** — 时间戳在实时场景下意义不大，Discord 消息本身有时间。会后纪要中也不需要精确到秒的时间戳，重点是"谁说了什么"。
+运行方式：
+```bash
+source .venv/bin/activate
+python voice_bot.py
+```
 
-### 2. 声纹注册与识别
+环境变量（`.env`，启动时自动加载）：
+```
+VOICE_DISCORD_TOKEN=...      # Discord Bot Token
+HF_TOKEN=...                 # HuggingFace Token（声纹模型下载）
+OPENCLAW_GATEWAY_URL=...     # 可选，Phase 2 集成用，默认 http://localhost:18789
+OPENCLAW_GATEWAY_TOKEN=...   # 可选
+```
 
-**用户操作：**
-- `/register_voice [seconds]` — 录制 5-30 秒语音样本，注册声纹
+---
 
-**行为：**
-- 用户执行命令后，机器人录制指定时长的语音
-- 使用 speechbrain/ecapa-tdnn 提取 speaker embedding
-- 将 embedding 与用户的 Discord ID、用户名绑定存储
-- 后续转录时，通过余弦相似度匹配识别说话人
-- 未注册用户显示 Discord 用户名（从频道成员信息获取）
+## Discord 命令
 
-**识别逻辑：**
-- 相似度阈值：0.7（高于此值认为匹配成功）
-- 未匹配到已注册声纹时，回退到 Discord 用户名
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `/voice_on` | `language`（zh/en，默认 zh） | 加入语音频道，开始实时转录 |
+| `/voice_off` | 无 | 停止转录，生成并发送会议纪要 |
+| `/register_voice` | `seconds`（5-30，默认 10） | 录制声纹样本，注册说话人身份 |
 
-### 3. 声纹持久化
+---
 
-**存储位置：** `data/speaker_profiles/`
+## 功能说明
 
-**存储格式：**
+### 1. VAD 切分（按停顿切句）
+
+不再按固定时长（原来3秒）切断，而是根据 Silero VAD 的停顿自动判断句子边界：
+
+```
+有人说话 → 持续累积音频
+停顿 >= SILENCE_TIMEOUT → 认为一句话说完 → 送去转录
+累积 >= MAX_SPEECH_DURATION → 强制切断，防止单句过长
+```
+
+**可调参数（`voice_bot.py` 顶部）：**
+
+| 常量 | 默认值 | 说明 |
+|------|--------|------|
+| `VAD_FRAME_DURATION` | 0.2 秒 | VAD 检测间隔 |
+| `SILENCE_TIMEOUT` | 0.8 秒 | 停顿多久算说完一句 |
+| `MAX_SPEECH_DURATION` | 15.0 秒 | 单句最长时长，超过强制切断 |
+| `VAD_THRESHOLD` | 0.5 | Silero VAD 判断有声音的概率阈值（0~1） |
+
+说话节奏较慢时可将 `SILENCE_TIMEOUT` 调大到 `1.2`；想要更快出结果可调小到 `0.5`。
+
+### 2. 声纹识别
+
+**注册流程：**
+1. 用户执行 `/register_voice seconds:15`
+2. 机器人录制指定时长语音
+3. `speechbrain/ecapa-tdnn` 模型提取 speaker embedding（在 CPU 上运行）
+4. embedding 以 `.npy` 格式持久化到 `data/speaker_profiles/`
+
+**识别流程（每句话转录前）：**
+1. 对当前音频提取 embedding
+2. 与所有已注册声纹做余弦相似度对比
+3. 相似度 >= 0.7 → 匹配成功，使用注册名
+4. 未匹配 → 回退到 Discord 显示名
+
+**声纹存储结构：**
 ```
 data/speaker_profiles/
 ├── profiles.json           # 元数据索引
 └── embeddings/
-    ├── 123456789.npy       # 用户 ID 命名的 embedding 文件
+    ├── 123456789.npy       # 用户 Discord ID 命名
     └── 987654321.npy
 ```
 
-**profiles.json 结构：**
+**profiles.json 格式：**
 ```json
 {
   "123456789": {
@@ -72,72 +100,84 @@ data/speaker_profiles/
 }
 ```
 
-**行为：**
-- 注册声纹时写入文件
-- 机器人启动时自动加载已有声纹
-- 重启不丢失数据
+机器人启动时自动加载已有声纹，重启不丢失数据。
 
-### 4. 会后纪要生成
+### 3. ASR 转录
 
-**触发时机：** 用户执行 `/stop_voice_chat` 时
+- 引擎：`mlx-whisper`（Apple Silicon 专用，比 openai-whisper 快 3-5 倍）
+- 模型：`mlx-community/whisper-small-mlx`（244M 参数，速度与精度平衡）
+- 重采样：`torchaudio.transforms.Resample`（sinc 算法，48kHz → 16kHz）
 
-**行为：**
-- 汇总本次会议所有转录记录
-- 按时间顺序整理为完整 transcript
-- 合并同一说话人的连续短句（避免碎片化）
-- 发送到语音频道的文字聊天中
+### 4. 实时输出格式
 
-**输出格式：**
+每句话说完后，立即发到 Discord 文字频道：
 ```
---- 会议纪要 ---
-时长: 45 分钟
-参与者: 张三, 李四, 王五
-
-[张三]: 今天讨论部署方案
-[李四]: 我建议用 Vercel，前端部署很方便
-[张三]: 那后端呢？
-[王五]: 后端可以用 Docker 部署到 fly.io
-...
+🎙️ [张三]: 我觉得部署方案可以用 Vercel
+🎙️ [李四]: 那数据库怎么处理？
 ```
 
-## 现有代码问题与改造方向
+### 5. 会后纪要（/voice_off 触发）
 
-### 问题 1: 非真正实时
+停止转录后，对每个用户会议期间所有有声音帧（经 VAD 过滤的 PCM）重新跑一遍 mlx-whisper，生成高质量完整转录：
 
-当前 `realtime_voice.py` 使用 `discord.sinks.WaveSink`，这是一个批量录音 Sink —— 调用 `stop_recording()` 后才能拿到音频数据。当前代码通过反复 stop/start 来模拟实时，但这不可靠。
+```
+--- 会议纪要（完整录音转录版）---
+时长: 12 分 34 秒
+参与者: 张三, 李四
 
-**改造方向：** 实现自定义 Sink，在 `write()` 方法中直接将音频数据推入内存 buffer，不依赖 stop_recording 触发。或者调研 pycord 是否提供 per-packet callback 机制。
+【张三】
+我觉得部署方案可以用 Vercel，数据库用 Supabase 就行，成本低而且免运维。
 
-### 问题 2: 音频重采样质量
+【李四】
+那边的 API 限速怎么处理？我们上次遇到过这个问题。
+```
 
-当前使用简单线性插值从 48kHz 降采样到 16kHz，可能引入音质损失。
+> 会后纪要使用完整录音重新转录，准确度高于实时片段拼接。只有语音帧（VAD 有声）会被送入 Whisper，静音段已过滤，避免 Whisper 产生幻觉（重复循环文字）。
 
-**改造方向：** 使用 `torchaudio.transforms.Resample` 或 `scipy.signal.resample`，质量更好。
+---
 
-### 问题 3: 声纹数据不持久
+## 音频处理流程
 
-当前 `SpeakerRecognizer` 的 `speaker_profiles` 是内存 dict，重启丢失。
+```
+Discord 音频流（48kHz 立体声 PCM）
+  ↓
+读指针增量读取（不 truncate，消除读写竞争）
+  ↓
+每 200ms 取一帧（VAD frame）
+  ↓
+Silero VAD 判断是否有人声
+  ├── 有声 → 追加到 speech buffer + full_audio（用于会后纪要）
+  └── 静音 >= 0.8s → 送去实时转录
+            ↓
+      stereo → mono
+            ↓
+      48kHz → 16kHz（torchaudio Resample）
+            ↓
+      soundfile 写 WAV（临时文件）
+            ↓
+      speechbrain/ecapa-tdnn 声纹匹配（asyncio.to_thread）
+            ↓
+      mlx-whisper 转录（asyncio.to_thread）
+            ↓
+      发送到 Discord 文字频道
+            ↓
+/voice_off → full_audio（各用户有声帧合集）→ mlx-whisper 完整转录 → 会议纪要
+```
 
-**改造方向：** 按上述存储格式持久化到 `data/speaker_profiles/`。
+---
 
-### 问题 4: 代码重复
-
-`voice_bot.py` 与 `cogs/realtime_voice.py` 功能重叠，应删除 `voice_bot.py` 和 `start_voice_bot.sh`，统一用 cog 架构。
-
-### 问题 5: 未使用的依赖
-
-`requirements.txt` 中 `websocket-client`、`speechrecognition`、`aiofiles` 未被使用，应清理。
-
-## 技术约束（来自 CLAUDE.md）
+## 技术约束
 
 1. **ASR 引擎**：必须使用 `mlx-whisper`，禁止使用普通 `openai-whisper`
-2. **Diarization 引擎**：必须使用 `pyannote.audio` 3.1
-3. **硬件**：Apple Silicon，pyannote pipeline 强制 `torch.device("cpu")`
-4. **异步安全**：转录和声纹推理是阻塞操作，必须放入 `asyncio.to_thread` 或 `ThreadPoolExecutor`
+2. **声纹模型**：`speechbrain/ecapa-tdnn`，通过 pyannote 的 `PretrainedSpeakerEmbedding` 加载
+3. **硬件**：Apple Silicon，声纹模型强制 `torch.device("cpu")`
+4. **异步安全**：转录和声纹推理均通过 `asyncio.to_thread` 在线程池中执行，不阻塞事件循环
+
+---
 
 ## 不在 Phase 1 范围
 
 - OpenClaw 集成（触发词检测、命令确认、AI 回复） → Phase 2
-- Web 实时显示页面
 - 多服务器声纹隔离（当前所有服务器共享声纹库）
-- 录音文件持久化保存（当前处理完即删除）
+- 录音文件持久化保存（处理完即删除临时文件）
+- 声纹管理命令（列出已注册声纹、删除声纹等）
