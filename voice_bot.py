@@ -357,6 +357,52 @@ class SileroVAD:
                     return True
         return False
 
+    def get_speech_segments(
+        self,
+        audio: np.ndarray,
+        sr: int = TARGET_RATE,
+        threshold: float = VAD_THRESHOLD,
+        min_speech_secs: float = 0.5,
+        merge_gap_secs: float = 0.3,
+    ) -> list[tuple[float, float]]:
+        """对整段音频做 VAD，返回语音时间段列表 [(start_sec, end_sec), ...]。"""
+        wav = torch.from_numpy(audio).float()
+        window_size = 512  # ~32ms at 16kHz
+        probs = []
+        with torch.no_grad():
+            for i in range(0, len(wav), window_size):
+                chunk = wav[i:i + window_size]
+                if len(chunk) < window_size:
+                    chunk = torch.nn.functional.pad(chunk, (0, window_size - len(chunk)))
+                probs.append(self.model(chunk, sr).item())
+
+        frame_dur = window_size / sr
+        # 合并相邻语音帧，过滤静音
+        segments: list[tuple[float, float]] = []
+        in_speech = False
+        seg_start = 0.0
+        for i, prob in enumerate(probs):
+            t = i * frame_dur
+            if not in_speech and prob >= threshold:
+                in_speech = True
+                seg_start = t
+            elif in_speech and prob < threshold:
+                in_speech = False
+                segments.append((seg_start, t))
+        if in_speech:
+            segments.append((seg_start, len(audio) / sr))
+
+        # 合并间隔小于 merge_gap_secs 的相邻段
+        merged: list[tuple[float, float]] = []
+        for start, end in segments:
+            if merged and start - merged[-1][1] <= merge_gap_secs:
+                merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+
+        # 过滤太短的段
+        return [(s, e) for s, e in merged if e - s >= min_speech_secs]
+
 
 class SpeakerRecognizer:
     """Speaker recognition using speechbrain/ecapa-tdnn embeddings with disk persistence."""
@@ -643,7 +689,7 @@ class VoiceBot(commands.Bot):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _run_diarization(self, wav_path: Path) -> list[tuple[float, float, str]]:
+    def _run_diarization(self, wav_path: Path, num_speakers: int | None = None) -> list[tuple[float, float, str]]:
         """pyannote diarization，结果缓存 pipeline 避免重复加载。"""
         if self._diarization_pipeline is None:
             from pyannote.audio import Pipeline
@@ -656,7 +702,7 @@ class VoiceBot(commands.Bot):
             self._diarization_pipeline.to(device)
             self._diarization_pipeline._segmentation.batch_size = 64
             self._diarization_pipeline._embedding.batch_size = 64
-        return run_diarization_on_file(wav_path, self._diarization_pipeline)
+        return run_diarization_on_file(wav_path, self._diarization_pipeline, num_speakers=num_speakers)
 
     def _match_diarization_to_profiles(
         self,
@@ -685,24 +731,45 @@ class VoiceBot(commands.Bot):
         text_channel,
     ) -> None:
         """会议纪要生成：优先用实时转录结果，否则回退到 diarization + Whisper。"""
+        # room_user_id：执行 /voice_on 的人，默认视为会议室共享麦克风（多人），需要 diarization
+        # 其余用户各自有独立麦克风，直接用实时转录结果（已按 Discord 用户区分）
+        room_user_id = session.get("room_user_id")
         realtime_transcript = session.get("transcript", [])
-        if realtime_transcript and all("start" in e for e in realtime_transcript):
-            LOGGER.info("Using realtime transcript (%d entries), skipping diarization+Whisper", len(realtime_transcript))
-            duration_secs = int(time.time() - session.get("start_time", time.time()))
-            entries = [{"speaker": e["speaker"], "start": e["start"], "text": e["text"]} for e in realtime_transcript]
-            summary = format_minutes(entries, duration_secs)
-            for i in range(0, len(summary), 1900):
-                await text_channel.send(f"```\n{summary[i:i+1900]}\n```")
-            return
 
-        await text_channel.send("⏳ **正在生成会议纪要（diarization + 转录），请稍候...**")
+        # 非会议室用户的实时转录直接转为 entries
+        entries: list[dict] = []
+        if realtime_transcript:
+            for e in realtime_transcript:
+                if "start" not in e:
+                    continue
+                # 跳过会议室麦克风的条目，会议室用户后续走 diarization
+                speaker_uid = next(
+                    (uid for uid, name in [
+                        (uid, self._get_display_name(uid)) for uid in user_pcm
+                    ] if name == e["speaker"]),
+                    None,
+                )
+                if speaker_uid == room_user_id:
+                    continue
+                entries.append({"speaker": e["speaker"], "start": e["start"], "text": e["text"]})
+            LOGGER.info("Loaded %d entries from realtime transcript (excluding room user)", len(entries))
+
+        room_speakers = session.get("room_speakers", 1)
+        has_room_audio = room_user_id and room_user_id in user_pcm and user_pcm[room_user_id]
+        if has_room_audio:
+            if room_speakers > 1:
+                await text_channel.send(f"⏳ **正在对会议室音频做说话人分离（{room_speakers} 人），请稍候...**")
+            else:
+                await text_channel.send("⏳ **正在转录会议室音频...**")
+        elif not entries:
+            await text_channel.send("⏳ **正在生成会议纪要，请稍候...**")
 
         import soundfile as sf
 
-        entries: list[dict] = []
-
         for user_id, pcm_bytes in user_pcm.items():
             if not pcm_bytes:
+                continue
+            if user_id != room_user_id:
                 continue
 
             display_name = self._get_display_name(user_id)
@@ -715,32 +782,52 @@ class VoiceBot(commands.Bot):
                     arr_mono = arr
                 audio_float = self._resample_tensor(arr_mono, SAMPLE_RATE, TARGET_RATE)
 
-                full_wav = temp_dir / f"full_{user_id}.wav"
-                sf.write(str(full_wav), audio_float, TARGET_RATE)
+                # VAD：拿到语音时间段，过滤静音，供 diarization 和 Whisper 使用
+                LOGGER.info("Running VAD on room audio (%s)...", display_name)
+                vad_segments = await asyncio.to_thread(self.vad.get_speech_segments, audio_float)
+                LOGGER.info("VAD found %d speech segments (%.1f%% of audio)",
+                            len(vad_segments),
+                            100 * sum(e - s for s, e in vad_segments) / (len(audio_float) / TARGET_RATE + 1e-6))
 
-                LOGGER.info("Running diarization for user %s (%s)...", user_id, display_name)
-                try:
-                    segments = await asyncio.to_thread(self._run_diarization, full_wav)
-                except Exception:
-                    LOGGER.exception("Diarization failed for user %s, falling back to single-speaker", user_id)
-                    segments = [(0.0, len(audio_float) / TARGET_RATE, "SPEAKER_0")]
+                if room_speakers > 1:
+                    # 多人：diarization → 声纹匹配 → Whisper
+                    full_wav = temp_dir / f"full_{user_id}.wav"
+                    sf.write(str(full_wav), audio_float, TARGET_RATE)
+                    LOGGER.info("Running diarization for room user %s (%s), num_speakers=%d...",
+                                user_id, display_name, room_speakers)
+                    try:
+                        segments = await asyncio.to_thread(
+                            self._run_diarization, full_wav, room_speakers
+                        )
+                    except Exception:
+                        LOGGER.exception("Diarization failed for room user %s, falling back to VAD segments", user_id)
+                        segments = [(s, e, "SPEAKER_0") for s, e in vad_segments]
 
-                if not segments:
-                    continue
+                    if not segments:
+                        continue
 
-                LOGGER.info("Diarization found %d segments for user %s", len(segments), user_id)
+                    LOGGER.info("Diarization found %d segments for room user %s", len(segments), user_id)
 
-                if self.speaker_recognizer.speaker_profiles:
-                    label_to_name = await asyncio.to_thread(
-                        self._match_diarization_to_profiles, full_wav, segments, audio_float
+                    if self.speaker_recognizer.speaker_profiles:
+                        label_to_name = await asyncio.to_thread(
+                            self._match_diarization_to_profiles, full_wav, segments, audio_float
+                        )
+                    else:
+                        unique_labels = list(dict.fromkeys(s[2] for s in segments))
+                        label_to_name = {lbl: f"{display_name}_{lbl}" for lbl in unique_labels}
+
+                    new_entries = await asyncio.to_thread(
+                        transcribe_segments, segments, audio_float, label_to_name, language, temp_dir
                     )
                 else:
-                    unique_labels = list(dict.fromkeys(s[2] for s in segments))
-                    label_to_name = {lbl: f"{display_name}_{lbl}" for lbl in unique_labels}
+                    # 单人：直接用 VAD 段送 Whisper，跳过 diarization
+                    LOGGER.info("Single speaker mode: transcribing %d VAD segments directly", len(vad_segments))
+                    vad_diar_segments = [(s, e, "SPEAKER_0") for s, e in vad_segments]
+                    new_entries = await asyncio.to_thread(
+                        transcribe_segments, vad_diar_segments, audio_float,
+                        {"SPEAKER_0": display_name}, language, temp_dir
+                    )
 
-                new_entries = await asyncio.to_thread(
-                    transcribe_segments, segments, audio_float, label_to_name, language, temp_dir
-                )
                 entries.extend(new_entries)
 
             except Exception:
@@ -832,7 +919,7 @@ def main():
     bot = VoiceBot()
 
     @bot.slash_command(name="voice_on", description="开启实时语音转文字")
-    async def voice_on(ctx: discord.ApplicationContext, language: str = "zh"):
+    async def voice_on(ctx: discord.ApplicationContext, language: str = "zh", room_speakers: int = 1):
         # defer 必须在 3 秒内调用，放在最前面避免后续操作超时
         if not ctx.response.is_done():
             await ctx.defer()
@@ -871,6 +958,8 @@ def main():
             "language": language,
             "start_time": time.time(),
             "transcript": [],
+            "room_user_id": ctx.author.id,  # 开启命令的人，视为会议室麦克风
+            "room_speakers": room_speakers,  # 会议室人数，1=单人直接转录，>1=diarization
         }
 
         await ctx.followup.send(
