@@ -61,6 +61,22 @@ python voice_bot.py
 | `OPENCLAW_GATEWAY_URL` | 否 | OpenClaw Gateway 地址，默认 http://localhost:18789 |
 | `OPENCLAW_GATEWAY_TOKEN` | 否 | OpenClaw Gateway Token |
 
+## 模型缓存目录
+
+首次运行时模型自动下载，缓存在以下位置（总计约 1.7GB）：
+
+| 模型 | 缓存路径 | 大小 | 用途 |
+|------|---------|------|------|
+| whisper-medium-mlx | `~/.cache/huggingface/hub/models--mlx-community--whisper-medium-mlx/` | ~1.1GB | 语音转文字 |
+| speechbrain/ecapa-tdnn | `~/.cache/huggingface/hub/models--speechbrain--spkrec-ecapa-voxceleb/` | ~91MB | 声纹 embedding |
+| pyannote/speaker-diarization-3.1 | `~/.cache/huggingface/hub/models--pyannote--speaker-diarization-3.1/` | ~8KB | 说话人分离 pipeline |
+| pyannote/segmentation-3.0 | `~/.cache/huggingface/hub/models--pyannote--segmentation-3.0/` | ~5.6MB | 语音分割 |
+| pyannote/wespeaker-resnet34 | `~/.cache/huggingface/hub/models--pyannote--wespeaker-voxceleb-resnet34-LM/` | ~25MB | 说话人验证 |
+| silero-vad | `~/.cache/torch/hub/snakers4_silero-vad_master/` | ~34MB | 语音活动检测 |
+
+> 如需迁移到其他机器，复制以上目录即可离线使用，无需重新下载。
+> Whisper 模型版本由 `voice_bot.py` 顶部的 `WHISPER_MODEL` 常量控制。
+
 ## 项目结构
 
 ```

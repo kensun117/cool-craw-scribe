@@ -48,7 +48,16 @@ WHISPER_INITIAL_PROMPT = {
     "en": "",
 }
 
-MIN_SPEECH_DURATION = 1.0  # 低于此秒数的片段不送 Whisper
+MIN_SPEECH_DURATION = 1.0   # 低于此秒数的片段不送 Whisper
+SIMILARITY_THRESHOLD = 0.55  # 声纹匹配相似度阈值
+
+
+def _clean_transcript(text: str, language: str = "zh") -> str:
+    """清理转录结果：去掉 initial_prompt 泄漏的文本。"""
+    prompt = WHISPER_INITIAL_PROMPT.get(language, "")
+    if prompt and prompt in text:
+        text = text.replace(prompt, "").strip()
+    return text
 
 
 def _is_hallucination(text: str) -> bool:
@@ -59,12 +68,151 @@ def _is_hallucination(text: str) -> bool:
     for ch in set(text):
         if text.count(ch) > max(10, len(text) * 0.5):
             return True
-    # 短语重复检测：取前 10 个字符作为模式，看重复次数
+    # 短语重复检测：取前 5 个字符作为模式，看重复次数
     if len(text) >= 20:
         pattern = text[:5]
         if text.count(pattern) > len(text) / (len(pattern) * 2):
             return True
     return False
+
+
+def run_diarization_on_file(
+    wav_path: Path,
+    pipeline,
+) -> list[tuple[float, float, str]]:
+    """对 WAV 文件跑 pyannote diarization，返回 [(start, end, label), ...]。"""
+    diarization = pipeline(str(wav_path))
+    segments = [
+        (turn.start, turn.end, speaker)
+        for turn, _, speaker in diarization.itertracks(yield_label=True)
+    ]
+    segments.sort(key=lambda x: x[0])
+    return segments
+
+
+def match_labels_to_speakers(
+    segments: list[tuple[float, float, str]],
+    audio_float: np.ndarray,
+    profiles: dict[int, dict],
+    extract_embedding_fn,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+) -> dict[str, str]:
+    """
+    将 diarization label 映射到注册说话人名字。
+    profiles: {user_id: {"username": str, "embedding": np.ndarray}}
+    extract_embedding_fn: 接受 Path，返回 np.ndarray 或 None
+    """
+    import soundfile as sf
+
+    label_audio: dict[str, list[np.ndarray]] = {}
+    for start, end, label in segments:
+        s, e = int(start * TARGET_RATE), int(end * TARGET_RATE)
+        chunk = audio_float[s:e]
+        if len(chunk) > 0:
+            label_audio.setdefault(label, []).append(chunk)
+
+    label_embedding: dict[str, Optional[np.ndarray]] = {}
+    for label, chunks in label_audio.items():
+        combined = np.concatenate(chunks)
+        if len(combined) < TARGET_RATE * 0.5:
+            label_embedding[label] = None
+            continue
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            tmp_wav = tmp_dir / f"spk_{label}.wav"
+            sf.write(str(tmp_wav), combined, TARGET_RATE)
+            label_embedding[label] = extract_embedding_fn(tmp_wav)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    label_to_name: dict[str, str] = {}
+    if profiles:
+        scores: list[tuple[float, str, int]] = []
+        for label, emb in label_embedding.items():
+            if emb is None:
+                continue
+            for uid, profile in profiles.items():
+                sim = float(np.dot(emb.flatten(), profile["embedding"].flatten()) / (
+                    np.linalg.norm(emb) * np.linalg.norm(profile["embedding"]) + 1e-9
+                ))
+                LOGGER.info("Similarity %s vs %s: %.4f (threshold=%.2f)",
+                            label, profile["username"], sim, similarity_threshold)
+                scores.append((sim, label, uid))
+
+        scores.sort(reverse=True)
+        used_labels: set[str] = set()
+        used_profiles: set[int] = set()
+        for sim, label, uid in scores:
+            if label in used_labels or uid in used_profiles:
+                continue
+            if sim >= similarity_threshold:
+                name = profiles[uid]["username"]
+                LOGGER.info("Diarization %s → %s (score=%.3f)", label, name, sim)
+                label_to_name[label] = name
+                used_labels.add(label)
+                used_profiles.add(uid)
+
+    for label in label_embedding:
+        if label not in label_to_name:
+            LOGGER.info("Diarization %s → 未匹配，标记匿名", label)
+            label_to_name[label] = f"{label}(匿名)"
+
+    return label_to_name
+
+
+def transcribe_segments(
+    segments: list[tuple[float, float, str]],
+    audio_float: np.ndarray,
+    label_to_name: dict[str, str],
+    language: str,
+    tmp_dir: Path,
+) -> list[dict]:
+    """对每个 diarization 片段跑 Whisper，返回 [{"speaker", "start", "text"}, ...]。"""
+    import soundfile as sf
+    entries = []
+    prompt = WHISPER_INITIAL_PROMPT.get(language, "")
+    for start, end, label in segments:
+        if end - start < 0.5:
+            continue
+        s_idx, e_idx = int(start * TARGET_RATE), int(end * TARGET_RATE)
+        chunk = audio_float[s_idx:e_idx]
+        if len(chunk) == 0:
+            continue
+        seg_wav = tmp_dir / f"seg_{label}_{int(start*1000)}.wav"
+        sf.write(str(seg_wav), chunk, TARGET_RATE)
+        try:
+            result = mlx_whisper.transcribe(
+                str(seg_wav),
+                path_or_hf_repo=WHISPER_MODEL,
+                language=language,
+                word_timestamps=False,
+                initial_prompt=prompt,
+            )
+            text = _clean_transcript(result.get("text", "").strip(), language)
+            if text and len(text) > 1 and not _is_hallucination(text):
+                speaker = label_to_name.get(label, f"{label}(匿名)")
+                entries.append({"speaker": speaker, "start": start, "text": text})
+        except Exception:
+            LOGGER.exception("Segment transcription failed: %s %.1f-%.1f", label, start, end)
+    return entries
+
+
+def format_minutes(entries: list[dict], duration_secs: int = 0) -> str:
+    """将转录条目格式化为会议纪要文本。"""
+    entries = sorted(entries, key=lambda x: x["start"])
+    merged = []
+    for e in entries:
+        if merged and merged[-1]["speaker"] == e["speaker"]:
+            merged[-1]["text"] += "　" + e["text"]
+        else:
+            merged.append({"speaker": e["speaker"], "text": e["text"]})
+    participants = list(dict.fromkeys(e["speaker"] for e in merged))
+    lines = "\n\n".join(f"【{e['speaker']}】\n{e['text']}" for e in merged)
+    header = "--- 会议纪要（diarization 版）---\n"
+    if duration_secs:
+        header += f"时长: {duration_secs // 60} 分 {duration_secs % 60} 秒\n"
+    header += f"参与者: {', '.join(participants)}\n\n"
+    return header + lines
 
 
 @dataclass
@@ -362,7 +510,7 @@ class VoiceBot(commands.Bot):
                 initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
             )
 
-            text = result.get("text", "").strip()
+            text = _clean_transcript(result.get("text", "").strip(), language)
             if text and len(text) > 2 and not _is_hallucination(text):
                 LOGGER.info("[%s] %s", speaker_name, text)
                 for session in self.active_sessions.values():
@@ -382,11 +530,7 @@ class VoiceBot(commands.Bot):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _run_diarization(self, wav_path: Path) -> list[tuple[float, float, str]]:
-        """
-        用 pyannote speaker-diarization-3.1 对混音音频做说话人分离。
-        返回 [(start_sec, end_sec, speaker_label), ...]，按时间排序。
-        需要 HF_TOKEN 且已在 HuggingFace 接受 pyannote 模型使用条款。
-        """
+        """pyannote diarization，结果缓存 pipeline 避免重复加载。"""
         if self._diarization_pipeline is None:
             from pyannote.audio import Pipeline
             self._diarization_pipeline = Pipeline.from_pretrained(
@@ -396,12 +540,7 @@ class VoiceBot(commands.Bot):
             device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
             LOGGER.info("Diarization pipeline loaded, using device: %s", device)
             self._diarization_pipeline.to(device)
-        diarization = self._diarization_pipeline(str(wav_path))
-        segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append((turn.start, turn.end, speaker))
-        segments.sort(key=lambda x: x[0])
-        return segments
+        return run_diarization_on_file(wav_path, self._diarization_pipeline)
 
     def _match_diarization_to_profiles(
         self,
@@ -409,85 +548,18 @@ class VoiceBot(commands.Bot):
         segments: list[tuple[float, float, str]],
         audio_float: np.ndarray,
     ) -> dict[str, str]:
-        """
-        对 diarization 分出的每个 speaker label，取其所有片段的音频，
-        用 ecapa-tdnn 提取 embedding，与注册声纹库对比，返回映射表：
-        {speaker_label: display_name}
-        """
-        import soundfile as sf
-
-        # 按 speaker label 归并所有片段的音频
-        label_audio: dict[str, list[np.ndarray]] = {}
-        for start, end, label in segments:
-            s = int(start * TARGET_RATE)
-            e = int(end * TARGET_RATE)
-            chunk = audio_float[s:e]
-            if len(chunk) > 0:
-                label_audio.setdefault(label, []).append(chunk)
-
-        self.speaker_recognizer.load_model()
-
-        # 第一步：提取每个 label 的 embedding
-        label_embedding: dict[str, Optional[np.ndarray]] = {}
-        for label, chunks in label_audio.items():
-            combined = np.concatenate(chunks)
-            if len(combined) < TARGET_RATE * 0.5:
-                label_embedding[label] = None
-                continue
-            temp_dir = Path(tempfile.mkdtemp())
-            try:
-                temp_wav = temp_dir / f"spk_{label}.wav"
-                sf.write(str(temp_wav), combined, TARGET_RATE)
-                self.speaker_recognizer.load_model()
-                emb = self.speaker_recognizer.extract_embedding(temp_wav)
-                label_embedding[label] = emb
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # 第二步：构建 label × profile 相似度矩阵，做最优一对一分配
-        # 每个注册人只能匹配给相似度最高的那个 label，避免所有 label 都匹配到同一人
+        """声纹匹配：将 diarization label 映射到注册名。"""
         profiles = {
-            uid: p for uid, p in self.speaker_recognizer.speaker_profiles.items()
+            uid: {"username": p.username, "embedding": p.embedding}
+            for uid, p in self.speaker_recognizer.speaker_profiles.items()
             if p.embedding is not None
         }
-        label_to_name: dict[str, str] = {}
-
-        if profiles:
-            # 计算所有 (label, profile) 对的相似度
-            scores: list[tuple[float, str, int]] = []  # (score, label, user_id)
-            for label, emb in label_embedding.items():
-                if emb is None:
-                    continue
-                for uid, profile in profiles.items():
-                    sim = float(np.dot(emb.flatten(), profile.embedding.flatten()) / (
-                        np.linalg.norm(emb) * np.linalg.norm(profile.embedding) + 1e-9
-                    ))
-                    LOGGER.info("Similarity %s vs %s: %.4f (threshold=%.2f)",
-                                label, profile.username, sim,
-                                self.speaker_recognizer.similarity_threshold)
-                    scores.append((sim, label, uid))
-
-            # 贪心最优分配：按相似度从高到低，每个 label 和每个 profile 只用一次
-            scores.sort(reverse=True)
-            used_labels: set[str] = set()
-            used_profiles: set[int] = set()
-            for sim, label, uid in scores:
-                if label in used_labels or uid in used_profiles:
-                    continue
-                if sim >= self.speaker_recognizer.similarity_threshold:
-                    name = profiles[uid].username
-                    LOGGER.info("Diarization %s → %s (score=%.3f)", label, name, sim)
-                    label_to_name[label] = name
-                    used_labels.add(label)
-                    used_profiles.add(uid)
-
-        # 未匹配到的 label 标记为匿名
-        for label in label_embedding:
-            if label not in label_to_name:
-                LOGGER.info("Diarization %s → 未匹配，标记匿名", label)
-                label_to_name[label] = f"{label}(匿名)"
-
-        return label_to_name
+        self.speaker_recognizer.load_model()
+        return match_labels_to_speakers(
+            segments, audio_float, profiles,
+            self.speaker_recognizer.extract_embedding,
+            self.speaker_recognizer.similarity_threshold,
+        )
 
     async def _generate_final_minutes(
         self,
@@ -496,18 +568,12 @@ class VoiceBot(commands.Bot):
         language: str,
         text_channel,
     ) -> None:
-        """
-        会议纪要生成：
-        1. pyannote diarization 分离说话人片段
-        2. ecapa-tdnn 匹配注册声纹，给每个 speaker label 打名字
-        3. Whisper 对每个片段转录
-        4. 按时间顺序拼装纪要
-        """
+        """会议纪要生成：diarization → 声纹匹配 → Whisper 逐段转录。"""
         await text_channel.send("⏳ **正在生成会议纪要（diarization + 转录），请稍候...**")
 
         import soundfile as sf
 
-        entries: list[dict] = []  # {"speaker": str, "start": float, "text": str}
+        entries: list[dict] = []
 
         for user_id, pcm_bytes in user_pcm.items():
             if not pcm_bytes:
@@ -516,7 +582,6 @@ class VoiceBot(commands.Bot):
             display_name = self._get_display_name(user_id)
             temp_dir = Path(tempfile.mkdtemp())
             try:
-                # ── 1. 解码为 mono float32 @ 16kHz ──
                 arr = np.frombuffer(pcm_bytes, dtype=np.int16)
                 if arr.size >= 2 and arr.size % 2 == 0:
                     arr_mono = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
@@ -527,7 +592,6 @@ class VoiceBot(commands.Bot):
                 full_wav = temp_dir / f"full_{user_id}.wav"
                 sf.write(str(full_wav), audio_float, TARGET_RATE)
 
-                # ── 2. Diarization ──
                 LOGGER.info("Running diarization for user %s (%s)...", user_id, display_name)
                 try:
                     segments = await asyncio.to_thread(self._run_diarization, full_wav)
@@ -540,46 +604,18 @@ class VoiceBot(commands.Bot):
 
                 LOGGER.info("Diarization found %d segments for user %s", len(segments), user_id)
 
-                # ── 3. 声纹匹配：给每个 speaker label 打名字 ──
                 if self.speaker_recognizer.speaker_profiles:
                     label_to_name = await asyncio.to_thread(
                         self._match_diarization_to_profiles, full_wav, segments, audio_float
                     )
                 else:
-                    # 没有注册声纹，用 diarization label 直接显示
                     unique_labels = list(dict.fromkeys(s[2] for s in segments))
                     label_to_name = {lbl: f"{display_name}_{lbl}" for lbl in unique_labels}
 
-                # ── 4. 按片段转录 ──
-                for start, end, label in segments:
-                    duration = end - start
-                    if duration < 0.5:  # 太短跳过
-                        continue
-
-                    s_idx = int(start * TARGET_RATE)
-                    e_idx = int(end * TARGET_RATE)
-                    chunk = audio_float[s_idx:e_idx]
-                    if len(chunk) == 0:
-                        continue
-
-                    seg_wav = temp_dir / f"seg_{label}_{int(start*1000)}.wav"
-                    sf.write(str(seg_wav), chunk, TARGET_RATE)
-
-                    try:
-                        result = await asyncio.to_thread(
-                            mlx_whisper.transcribe,
-                            str(seg_wav),
-                            path_or_hf_repo=WHISPER_MODEL,
-                            language=language,
-                            word_timestamps=False,
-                            initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
-                        )
-                        text = result.get("text", "").strip()
-                        if text and len(text) > 1 and not _is_hallucination(text):
-                            speaker_name = label_to_name.get(label, label)
-                            entries.append({"speaker": speaker_name, "start": start, "text": text})
-                    except Exception:
-                        LOGGER.exception("Segment transcription failed: %s %.1f-%.1f", label, start, end)
+                new_entries = await asyncio.to_thread(
+                    transcribe_segments, segments, audio_float, label_to_name, language, temp_dir
+                )
+                entries.extend(new_entries)
 
             except Exception:
                 LOGGER.exception("Final minutes failed for user %s", user_id)
@@ -590,24 +626,8 @@ class VoiceBot(commands.Bot):
             await text_channel.send("⚠️ 没有录到有效音频，无法生成会议纪要。")
             return
 
-        # ── 5. 按时间排序，合并连续同一说话人的片段 ──
-        entries.sort(key=lambda x: x["start"])
-        merged: list[dict] = []
-        for e in entries:
-            if merged and merged[-1]["speaker"] == e["speaker"]:
-                merged[-1]["text"] += "　" + e["text"]
-            else:
-                merged.append({"speaker": e["speaker"], "text": e["text"]})
-
         duration_secs = int(time.time() - session.get("start_time", time.time()))
-        participants = list(dict.fromkeys(e["speaker"] for e in merged))
-        lines = "\n\n".join(f"【{e['speaker']}】\n{e['text']}" for e in merged)
-        summary = (
-            f"--- 会议纪要（diarization 版）---\n"
-            f"时长: {duration_secs // 60} 分 {duration_secs % 60} 秒\n"
-            f"参与者: {', '.join(participants)}\n\n"
-            f"{lines}"
-        )
+        summary = format_minutes(entries, duration_secs)
         for i in range(0, len(summary), 1900):
             await text_channel.send(f"```\n{summary[i:i+1900]}\n```")
 
@@ -863,11 +883,28 @@ def main():
 
         # full_audio 是处理循环逐帧积累的完整 PCM，直接用它做会后纪要
         user_pcm: dict[int, bytes] = {}
+        recordings_dir = Path("data/recordings")
+        recordings_dir.mkdir(parents=True, exist_ok=True)
+        import soundfile as sf
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
         for user_id in list(bot.full_audio.keys()):
             data = bot.full_audio.pop(user_id)
             if data:
                 user_pcm[user_id] = data
                 LOGGER.info("Collected full audio for user %s: %d bytes", user_id, len(data))
+                # 保存为 WAV，供后续离线重跑
+                try:
+                    arr = np.frombuffer(data, dtype=np.int16)
+                    if arr.size >= 2 and arr.size % 2 == 0:
+                        arr = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                    audio_float = bot._resample_tensor(arr, SAMPLE_RATE, TARGET_RATE)
+                    wav_path = recordings_dir / f"{ts}_user{user_id}.wav"
+                    sf.write(str(wav_path), audio_float, TARGET_RATE)
+                    LOGGER.info("Saved recording: %s", wav_path)
+                except Exception:
+                    LOGGER.exception("Failed to save recording for user %s", user_id)
 
         # 清理该 guild 的读指针和 speech state
         for user_id in list(bot.sink_read_pos.keys()):
