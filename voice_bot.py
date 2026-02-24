@@ -43,7 +43,16 @@ PROFILES_JSON = PROFILES_DIR / "profiles.json"
 EMBEDDINGS_DIR = PROFILES_DIR / "embeddings"
 
 # Whisper initial_prompt：引导输出简体中文，避免输出繁体
-WHISPER_MODEL = "mlx-community/whisper-medium-mlx"
+WHISPER_MODEL_REPO = "mlx-community/whisper-medium-mlx"
+# 优先使用本地缓存路径，避免每次调用都触发 HuggingFace hub 文件检查
+_whisper_local = (
+    Path.home()
+    / ".cache/huggingface/hub"
+    / f"models--{WHISPER_MODEL_REPO.replace('/', '--')}"
+    / "snapshots"
+)
+_snapshots = sorted(_whisper_local.iterdir()) if _whisper_local.exists() else []
+WHISPER_MODEL = str(_snapshots[-1]) if _snapshots else WHISPER_MODEL_REPO
 
 WHISPER_INITIAL_PROMPT = {
     "zh": "以下是普通话的转录，使用简体中文。",
@@ -268,7 +277,10 @@ def transcribe_segments(
 
     # ── Step 4: 串行转录（mlx-whisper 已充分利用 ANE，多线程反而引发 Metal 冲突）─
     entries = []
-    for start, end, label, seg_wav in pending:
+    _whisper_loaded = False
+    for i, (start, end, label, seg_wav) in enumerate(pending):
+        if not _whisper_loaded:
+            LOGGER.info("Loading Whisper model (first chunk)...")
         try:
             result = mlx_whisper.transcribe(
                 str(seg_wav),
@@ -284,6 +296,11 @@ def transcribe_segments(
                 entries.append({"speaker": speaker, "start": start, "text": text})
         except Exception:
             LOGGER.exception("Segment transcription failed: %s %.1f-%.1f", label, start, end)
+        if not _whisper_loaded:
+            LOGGER.info("Whisper model loaded, transcribing remaining %d chunks...", len(pending) - 1)
+            _whisper_loaded = True
+        else:
+            LOGGER.info("Chunk %d/%d done (%.1f-%.1fs)", i + 1, len(pending), start, end)
 
     entries.sort(key=lambda x: x["start"])
     return entries
@@ -614,10 +631,13 @@ class VoiceBot(commands.Bot):
                             await ch.send(f"🎙️ **[{speaker_name}]**: {text}")
                         except Exception:
                             LOGGER.warning("Failed to send transcription to Discord (network error), skipping")
+                    t_now = time.time()
+                    start_time = session.get("start_time", t_now)
                     session.setdefault("transcript", []).append({
                         "speaker": speaker_name,
                         "text": text,
-                        "ts": time.time(),
+                        "ts": t_now,
+                        "start": t_now - start_time,
                     })
                 await self._send_to_openclaw(text, speaker_name, user_id)
         finally:
@@ -664,7 +684,17 @@ class VoiceBot(commands.Bot):
         language: str,
         text_channel,
     ) -> None:
-        """会议纪要生成：diarization → 声纹匹配 → Whisper 逐段转录。"""
+        """会议纪要生成：优先用实时转录结果，否则回退到 diarization + Whisper。"""
+        realtime_transcript = session.get("transcript", [])
+        if realtime_transcript and all("start" in e for e in realtime_transcript):
+            LOGGER.info("Using realtime transcript (%d entries), skipping diarization+Whisper", len(realtime_transcript))
+            duration_secs = int(time.time() - session.get("start_time", time.time()))
+            entries = [{"speaker": e["speaker"], "start": e["start"], "text": e["text"]} for e in realtime_transcript]
+            summary = format_minutes(entries, duration_secs)
+            for i in range(0, len(summary), 1900):
+                await text_channel.send(f"```\n{summary[i:i+1900]}\n```")
+            return
+
         await text_channel.send("⏳ **正在生成会议纪要（diarization + 转录），请稍候...**")
 
         import soundfile as sf

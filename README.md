@@ -22,10 +22,36 @@ CoolScribe 是 CoolTools 生态中的会议效率工具。它加入 Discord 语�
 | 组件 | 技术选型 | 说明 |
 |------|----------|------|
 | Discord 框架 | pycord[voice] | 语音频道连接与录音 |
-| 语音转文字 (ASR) | mlx-whisper | Apple Silicon 加速，禁用普通 openai-whisper |
-| 声纹识别 | pyannote.audio 3.1 + speechbrain/ecapa-tdnn | 说话人分离与识别 |
-| 语音活动检测 | Silero VAD | 过滤静音片段 |
-| 硬件环境 | Apple Silicon (Mac M 系列) | pyannote 强制 CPU 运行 |
+| 语音转文字 (ASR) | mlx-whisper (whisper-medium-mlx) | Apple Silicon ANE 加速，禁用普通 openai-whisper |
+| 说话人区分（实时） | Discord 用户 ID | 每个用户麦克风独立音轨，天然隔离，不需要 diarization |
+| 说话人区分（会后） | pyannote.audio 3.1 + speechbrain/ecapa-tdnn | 仅在无实时转录数据时回退使用 |
+| 声纹注册/匹配 | speechbrain/spkrec-ecapa-voxceleb | 持久化到 `data/speaker_profiles/`，会后纪要用于标注说话人名字 |
+| 语音活动检测 | Silero VAD | 过滤静音片段，减少幻觉 |
+| 硬件环境 | Apple Silicon (Mac M 系列) | pyannote 使用 MPS 加速（diarization batch_size=64） |
+
+### 会议纪要生成流程
+
+```
+/voice_off 触发
+    ↓
+有实时转录数据？
+    ├── 是 → 直接用（说话人已按 Discord 用户区分），瞬间完成
+    └── 否 → diarization (pyannote/MPS) → 声纹匹配 → Whisper 逐段转录
+```
+
+### 离线重跑工具 `process_recording.py`
+
+对已保存的 WAV 文件执行完整的 diarization + 声纹匹配 + 转录流程：
+
+```bash
+python process_recording.py data/recordings/meeting.wav
+python process_recording.py data/recordings/meeting.wav --num-speakers 2  # 已知说话人数，提高准确性
+python process_recording.py data/recordings/meeting.wav --language en --output result.txt
+```
+
+- `--num-speakers`：已知说话人数量，跳过自动估计，准确性更高
+- `--output`：输出文件路径（默认与 WAV 同目录同名 `.txt`）
+- `--language`：`zh`（默认）或 `en`
 
 ## 环境要求
 
@@ -68,14 +94,16 @@ python voice_bot.py
 | 模型 | 缓存路径 | 大小 | 用途 |
 |------|---------|------|------|
 | whisper-medium-mlx | `~/.cache/huggingface/hub/models--mlx-community--whisper-medium-mlx/` | ~1.1GB | 语音转文字 |
-| speechbrain/ecapa-tdnn | `~/.cache/huggingface/hub/models--speechbrain--spkrec-ecapa-voxceleb/` | ~91MB | 声纹 embedding |
+| speechbrain/ecapa-tdnn | `~/.cache/speechbrain/spkrec-ecapa-voxceleb/` | ~91MB | 声纹 embedding |
 | pyannote/speaker-diarization-3.1 | `~/.cache/huggingface/hub/models--pyannote--speaker-diarization-3.1/` | ~8KB | 说话人分离 pipeline |
 | pyannote/segmentation-3.0 | `~/.cache/huggingface/hub/models--pyannote--segmentation-3.0/` | ~5.6MB | 语音分割 |
 | pyannote/wespeaker-resnet34 | `~/.cache/huggingface/hub/models--pyannote--wespeaker-voxceleb-resnet34-LM/` | ~25MB | 说话人验证 |
 | silero-vad | `~/.cache/torch/hub/snakers4_silero-vad_master/` | ~34MB | 语音活动检测 |
 
 > 如需迁移到其他机器，复制以上目录即可离线使用，无需重新下载。
-> Whisper 模型版本由 `voice_bot.py` 顶部的 `WHISPER_MODEL` 常量控制。
+>
+> speechbrain 模型缓存改为 `~/.cache/speechbrain/`（避免每次重新下载）。
+> Whisper 模型版本由 `voice_bot.py` 顶部的 `WHISPER_MODEL_REPO` 常量控制，启动时自动解析本地缓存路径。
 
 ## 项目结构
 
