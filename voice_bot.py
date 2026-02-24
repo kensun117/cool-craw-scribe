@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,6 +18,7 @@ import discord
 import mlx_whisper
 import numpy as np
 import requests
+import soundfile as sf
 import torch
 import torchaudio.transforms as T
 from discord.ext import commands
@@ -52,36 +54,81 @@ MIN_SPEECH_DURATION = 1.0   # 低于此秒数的片段不送 Whisper
 SIMILARITY_THRESHOLD = 0.55  # 声纹匹配相似度阈值
 
 
+# Whisper 有时只泄漏 prompt 中的片段词，而非完整句子
+_PROMPT_LEAK_FRAGMENTS = (
+    "以下是普通话的转录",
+    "使用简体中文",
+    "用简体中文",
+    "并且使用简体中文",
+)
+
+
 def _clean_transcript(text: str, language: str = "zh") -> str:
-    """清理转录结果：去掉 initial_prompt 泄漏的文本。"""
+    """清理转录结果：去掉 initial_prompt 泄漏（完整或片段）的文本。"""
     prompt = WHISPER_INITIAL_PROMPT.get(language, "")
     if prompt and prompt in text:
-        text = text.replace(prompt, "").strip()
-    return text
+        text = text.replace(prompt, "")
+    for frag in _PROMPT_LEAK_FRAGMENTS:
+        text = text.replace(frag, "")
+    return text.strip()
+
+
+# Whisper 在静音段常见的固定幻觉套话（前缀匹配）
+_HALLUCINATION_PREFIXES = (
+    "请不吝点赞",
+    "字幕由",
+    "Thanks for watching",
+    "Thank you for watching",
+    "Please subscribe",
+    "字幕组",
+)
 
 
 def _is_hallucination(text: str) -> bool:
-    """检测 Whisper 幻觉：单个字符重复超过 10 次，或最长重复子串占比超过 50%。"""
+    """检测 Whisper 幻觉输出。覆盖三类：
+    1. 固定套话前缀（静音段常见）
+    2. 单字符高频重复
+    3. 短语循环重复（滑动窗口扫描文本中任意位置的模式）
+    """
     if not text:
         return False
-    # 单字符重复检测
+
+    # 1. 固定套话
+    for prefix in _HALLUCINATION_PREFIXES:
+        if text.startswith(prefix):
+            return True
+
+    # 2. 单字符重复：某字符占比超 40%
     for ch in set(text):
-        if text.count(ch) > max(10, len(text) * 0.5):
+        if ch in (" ", "\n"):
+            continue
+        if text.count(ch) > len(text) * 0.4:
             return True
-    # 短语重复检测：取前 5 个字符作为模式，看重复次数
+
+    # 3. 短语循环：从文本任意位置取 3-16 字符的模式，
+    #    若该模式出现次数 × 模式长度 > 文本总长 60%，判定为幻觉
     if len(text) >= 20:
-        pattern = text[:5]
-        if text.count(pattern) > len(text) / (len(pattern) * 2):
-            return True
+        for window in range(3, 17):
+            # 以步长 window 在全文采样起点，避免 O(n²) 扫描
+            for offset in range(0, min(len(text) - window, window * 3), window):
+                pattern = text[offset:offset + window]
+                count = text.count(pattern)
+                if count * window > len(text) * 0.5:
+                    return True
+
     return False
 
 
 def run_diarization_on_file(
     wav_path: Path,
     pipeline,
+    num_speakers: int | None = None,
 ) -> list[tuple[float, float, str]]:
     """对 WAV 文件跑 pyannote diarization，返回 [(start, end, label), ...]。"""
-    diarization = pipeline(str(wav_path))
+    import torchaudio
+    waveform, sr = torchaudio.load(str(wav_path))
+    kwargs = {"num_speakers": num_speakers} if num_speakers else {}
+    diarization = pipeline({"waveform": waveform, "sample_rate": sr}, **kwargs)
     segments = [
         (turn.start, turn.end, speaker)
         for turn, _, speaker in diarization.itertracks(yield_label=True)
@@ -166,20 +213,62 @@ def transcribe_segments(
     label_to_name: dict[str, str],
     language: str,
     tmp_dir: Path,
+    merge_gap: float = 3.0,
+    min_duration: float = 1.0,
+    target_duration: float = 28.0,
 ) -> list[dict]:
-    """对每个 diarization 片段跑 Whisper，返回 [{"speaker", "start", "text"}, ...]。"""
-    import soundfile as sf
-    entries = []
-    prompt = WHISPER_INITIAL_PROMPT.get(language, "")
+    """
+    对 diarization 片段跑 Whisper，返回 [{"speaker", "start", "text"}, ...]。
+
+    策略：先把同一说话人相邻（gap <= merge_gap 秒）的短段合并成更长的片段，
+    再按 target_duration 上限切割，确保每段送给 Whisper 的音频足够长（减少空输出），
+    同时不超过 30 秒（Whisper 的 mel 窗口）。
+    """
+    # ── Step 1: 合并同说话人相邻短段 ──────────────────────────────────────
+    merged: list[tuple[float, float, str]] = []
     for start, end, label in segments:
-        if end - start < 0.5:
+        if end - start < 0.1:
             continue
+        if (
+            merged
+            and merged[-1][2] == label
+            and start - merged[-1][1] <= merge_gap
+        ):
+            merged[-1] = (merged[-1][0], end, label)
+        else:
+            merged.append((start, end, label))
+
+    # ── Step 2: 按 target_duration 二次切割，避免超 30s ──────────────────
+    chunks: list[tuple[float, float, str]] = []
+    for start, end, label in merged:
+        while end - start > target_duration:
+            chunks.append((start, start + target_duration, label))
+            start += target_duration
+        if end - start >= min_duration:
+            chunks.append((start, end, label))
+
+    # ── Step 3: 准备待转录的 chunk 列表（写 WAV + RMS 过滤）────────────────
+    prompt = WHISPER_INITIAL_PROMPT.get(language, "")
+    pending: list[tuple[float, float, str, Path]] = []  # (start, end, label, wav_path)
+
+    for start, end, label in chunks:
         s_idx, e_idx = int(start * TARGET_RATE), int(end * TARGET_RATE)
         chunk = audio_float[s_idx:e_idx]
         if len(chunk) == 0:
             continue
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        if rms < 0.008:
+            LOGGER.debug("Skipping near-silent chunk %s %.1f-%.1f (rms=%.4f)", label, start, end, rms)
+            continue
         seg_wav = tmp_dir / f"seg_{label}_{int(start*1000)}.wav"
         sf.write(str(seg_wav), chunk, TARGET_RATE)
+        pending.append((start, end, label, seg_wav))
+
+    LOGGER.info("Transcribing %d chunks sequentially...", len(pending))
+
+    # ── Step 4: 串行转录（mlx-whisper 已充分利用 ANE，多线程反而引发 Metal 冲突）─
+    entries = []
+    for start, end, label, seg_wav in pending:
         try:
             result = mlx_whisper.transcribe(
                 str(seg_wav),
@@ -187,6 +276,7 @@ def transcribe_segments(
                 language=language,
                 word_timestamps=False,
                 initial_prompt=prompt,
+                condition_on_previous_text=False,
             )
             text = _clean_transcript(result.get("text", "").strip(), language)
             if text and len(text) > 1 and not _is_hallucination(text):
@@ -194,6 +284,8 @@ def transcribe_segments(
                 entries.append({"speaker": speaker, "start": start, "text": text})
         except Exception:
             LOGGER.exception("Segment transcription failed: %s %.1f-%.1f", label, start, end)
+
+    entries.sort(key=lambda x: x["start"])
     return entries
 
 
@@ -301,8 +393,10 @@ class SpeakerRecognizer:
 
     def load_model(self) -> None:
         if self.embedding_model is None:
+            savedir = Path.home() / ".cache" / "speechbrain" / "spkrec-ecapa-voxceleb"
             self.embedding_model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=str(savedir),
                 run_opts={"device": "cpu"},
             )
             LOGGER.info("Speaker embedding model loaded")
@@ -540,6 +634,8 @@ class VoiceBot(commands.Bot):
             device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
             LOGGER.info("Diarization pipeline loaded, using device: %s", device)
             self._diarization_pipeline.to(device)
+            self._diarization_pipeline._segmentation.batch_size = 64
+            self._diarization_pipeline._embedding.batch_size = 64
         return run_diarization_on_file(wav_path, self._diarization_pipeline)
 
     def _match_diarization_to_profiles(
