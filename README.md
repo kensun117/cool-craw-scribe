@@ -34,10 +34,19 @@ CoolScribe 是 CoolTools 生态中的会议效率工具。它加入 Discord 语�
 ```
 /voice_off 触发
     ↓
-有实时转录数据？
-    ├── 是 → 直接用（说话人已按 Discord 用户区分），瞬间完成
-    └── 否 → diarization (pyannote/MPS) → 声纹匹配 → Whisper 逐段转录
+其他用户（独立麦克风）→ 直接用实时转录结果（已按 Discord user_id 区分说话人）
+    ↓
+room_user_id（执行 /voice_on 的人，可能多人共享麦克风）
+    ├── 优先用其实时转录结果（如果有）
+    └── 否则：Silero VAD 过滤静音
+            ├── room_speakers=1 → 直接 Whisper 转录
+            └── room_speakers>1 → diarization(num_speakers) → 声纹匹配 → Whisper 转录
 ```
+
+**Whisper 转录优化**（word_timestamps 对齐方案）：
+- 按 28 秒切时间大块（不按说话人切碎片），~36 chunks 代替原来的 ~94 chunks
+- 开启 `word_timestamps=True`，用 bisect 把每个词对齐到 diarization 说话人
+- 实测 998 秒音频：transcribe_segments 从 275s 降至 151s（-45%），总耗时 357s → 233s
 
 ### 离线重跑工具 `process_recording.py`
 
@@ -213,9 +222,11 @@ launchctl unload ~/Library/LaunchAgents/com.cooltools.voicebot.plist
 ### Discord 使用方式
 
 1. 进入语音频道
-2. 在文字频道执行 `/voice_on`（可选参数 `language`，默认 `zh`）
+2. 在文字频道执行 `/voice_on`
+   - `language`：`zh`（默认）或 `en`
+   - `room_speakers`：会议室人数（默认 `1`）。若多人共用一个麦克风开会，设置实际人数（如 `3`），会后自动 diarization 区分说话人
 3. Bot 加入语音频道后开始录音，检测到停顿后自动输出当前句子
-4. 执行 `/voice_off` 停止并退出
+4. 执行 `/voice_off` 停止并生成会议纪要
 
 ### 前置依赖
 

@@ -36,7 +36,7 @@ OPENCLAW_GATEWAY_TOKEN=...   # 可选
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `/voice_on` | `language`（zh/en，默认 zh） | 加入语音频道，开始实时转录 |
+| `/voice_on` | `language`（zh/en，默认 zh）<br>`room_speakers`（整数，默认 1） | 加入语音频道，开始实时转录。`room_speakers` 指定执行命令的人所在会议室的人数（1=单人直接转录，>1=会后 diarization 区分说话人） |
 | `/voice_off` | 无 | 停止转录，生成并发送会议纪要 |
 | `/register_voice` | `seconds`（5-30，默认 10） | 录制声纹样本，注册说话人身份 |
 
@@ -105,7 +105,7 @@ data/speaker_profiles/
 ### 3. ASR 转录
 
 - 引擎：`mlx-whisper`（Apple Silicon 专用，比 openai-whisper 快 3-5 倍）
-- 模型：`mlx-community/whisper-small-mlx`（244M 参数，速度与精度平衡）
+- 模型：`mlx-community/whisper-medium-mlx`（约 1.1GB，中文准确率与速度平衡最佳）
 - 重采样：`torchaudio.transforms.Resample`（sinc 算法，48kHz → 16kHz）
 
 ### 4. 实时输出格式
@@ -118,10 +118,23 @@ data/speaker_profiles/
 
 ### 5. 会后纪要（/voice_off 触发）
 
-停止转录后，对每个用户会议期间所有有声音帧（经 VAD 过滤的 PCM）重新跑一遍 mlx-whisper，生成高质量完整转录：
+停止转录后，按以下逻辑生成完整会议纪要：
 
 ```
---- 会议纪要（完整录音转录版）---
+/voice_off 触发
+    ↓
+其他用户（独立麦克风）→ 直接用实时转录结果（已按 Discord user_id 区分说话人）
+    ↓
+room_user_id（执行 /voice_on 的人，可能是多人共享麦克风）
+    ├── 优先用其实时转录结果（如果有）
+    └── 否则：Silero VAD 过滤静音
+            ├── room_speakers=1 → 直接送 Whisper 转录
+            └── room_speakers>1 → pyannote diarization(num_speakers) → 声纹匹配 → Whisper 转录
+```
+
+纪要格式：
+```
+--- 会议纪要（diarization 版）---
 时长: 12 分 34 秒
 参与者: 张三, 李四
 
@@ -132,7 +145,7 @@ data/speaker_profiles/
 那边的 API 限速怎么处理？我们上次遇到过这个问题。
 ```
 
-> 会后纪要使用完整录音重新转录，准确度高于实时片段拼接。只有语音帧（VAD 有声）会被送入 Whisper，静音段已过滤，避免 Whisper 产生幻觉（重复循环文字）。
+> 静音段经 Silero VAD 过滤后再送 Whisper，避免产生幻觉（重复循环文字）。`_is_hallucination` 函数额外检测固定套话、单字符重复、短语循环（占比 > 40% 则丢弃）。
 
 ---
 
@@ -169,9 +182,31 @@ Silero VAD 判断是否有人声
 ## 技术约束
 
 1. **ASR 引擎**：必须使用 `mlx-whisper`，禁止使用普通 `openai-whisper`
-2. **声纹模型**：`speechbrain/ecapa-tdnn`，通过 pyannote 的 `PretrainedSpeakerEmbedding` 加载
-3. **硬件**：Apple Silicon，声纹模型强制 `torch.device("cpu")`
-4. **异步安全**：转录和声纹推理均通过 `asyncio.to_thread` 在线程池中执行，不阻塞事件循环
+2. **声纹模型**：`speechbrain/ecapa-tdnn`（`speechbrain/spkrec-ecapa-voxceleb`），缓存到 `~/.cache/speechbrain/`，在 CPU 上运行
+3. **Diarization**：`pyannote/speaker-diarization-3.1`，使用 MPS 加速（batch_size=64），用完后 `del pipeline + torch.mps.empty_cache()` 释放资源避免与 mlx-whisper 的 Metal 冲突
+4. **硬件**：Apple Silicon，声纹 embedding 模型强制 `torch.device("cpu")`，diarization 使用 MPS
+5. **异步安全**：转录和声纹推理均通过 `asyncio.to_thread` 执行，不阻塞事件循环；串行转录（不并发），避免多线程 Metal 冲突
+
+## 会后转录性能（process_recording.py 实测，998 秒音频）
+
+| 阶段 | 耗时 |
+|------|------|
+| diarization（MPS） | ~71s |
+| 声纹匹配 | ~6s |
+| transcribe_segments（36 chunks） | ~151s |
+| **总计** | **~233s（约 3.9 分钟处理 16.6 分钟音频）** |
+
+### transcribe_segments 优化策略
+
+旧策略：按说话人切 94 个小 chunk（平均 2.9s）串行转录，耗时 275s。
+
+新策略（当前）：
+1. 按 28 秒为单位切时间大块（~36 个 chunk），不按说话人切割
+2. 开启 `word_timestamps=True` 获取词级时间戳
+3. 每个词取中间时间点，bisect 二分查找 diarization interval，分配说话人
+4. 相邻同说话人词语（间隔 ≤ 1.5s）合并为条目
+
+效果：chunk 数量 -62%，transcribe_segments 耗时 -45%，总耗时 -35%。
 
 ---
 
