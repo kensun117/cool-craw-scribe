@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -441,7 +442,16 @@ class RealtimeVoiceCog(commands.Cog):
                 f"参与者: {', '.join(participants)}\n\n"
                 f"{lines}"
             )
+            # Save to local file
+            out_dir = Path("data/transcripts")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filename = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+            out_path = out_dir / filename
+            out_path.write_text(summary, encoding="utf-8")
+            LOGGER.info("Transcript saved to %s", out_path)
+
             # Discord message limit: 2000 chars
+            await text_channel.send(f"会议纪要已保存至 `{out_path}`")
             for i in range(0, len(summary), 1900):
                 await text_channel.send(summary[i:i + 1900])
 

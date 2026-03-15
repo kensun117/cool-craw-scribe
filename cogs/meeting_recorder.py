@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import shutil
@@ -275,8 +276,19 @@ class MeetingRecorder(commands.Cog):
             return f"{hh:02d}:{mm:02d}:{ss:02d}"
         return f"{mm:02d}:{ss:02d}"
 
+    def _save_transcript(self, transcript: str) -> Path:
+        """Save transcript to data/transcripts/<datetime>.txt and return the path."""
+        out_dir = Path("data/transcripts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+        out_path = out_dir / filename
+        out_path.write_text(transcript, encoding="utf-8")
+        LOGGER.info("Transcript saved to %s", out_path)
+        return out_path
+
     async def _send_transcript(self, text_channel: discord.abc.Messageable, transcript: str) -> None:
-        header = "会议纪要如下："
+        out_path = self._save_transcript(transcript)
+        header = f"会议纪要如下：（已保存至 `{out_path}`）"
         max_text = 1800
         if len(transcript) <= max_text:
             await text_channel.send(f"{header}\n```\n{transcript}\n```")

@@ -727,6 +727,7 @@ class VoiceBot(commands.Bot):
                 language=language,
                 word_timestamps=False,
                 initial_prompt=WHISPER_INITIAL_PROMPT.get(language, ""),
+                condition_on_previous_text=False,
             )
 
             text = _clean_transcript(result.get("text", "").strip(), language)
@@ -903,8 +904,22 @@ class VoiceBot(commands.Bot):
 
         duration_secs = int(time.time() - session.get("start_time", time.time()))
         summary = format_minutes(entries, duration_secs)
+
+        # 保存到本地文件
+        import datetime
+        out_dir = Path("data/transcripts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+        out_path = out_dir / filename
+        out_path.write_text(summary, encoding="utf-8")
+        LOGGER.info("Transcript saved to %s", out_path)
+
+        await text_channel.send(f"📄 会议纪要已保存至 `{out_path}`")
         for i in range(0, len(summary), 1900):
             await text_channel.send(f"```\n{summary[i:i+1900]}\n```")
+
+        # 发送完整纪要给 OpenClaw
+        await self._send_to_openclaw(summary, "Meeting Summary", 0)
 
     async def _send_to_openclaw(self, text: str, username: str, user_id: int):
         try:
